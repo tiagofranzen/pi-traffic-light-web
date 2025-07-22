@@ -1,7 +1,7 @@
 A web-controlled traffic light for Raspberry Pi with multiple operating modes.
 
-Red → GPIO 17
+Red → GPIO 22
 
 Yellow → GPIO 27
 
-Green → GPIO 18
+Green → GPIO 17
