@@ -1,0 +1,104 @@
+import sys
+import os
+import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+
+# The base URL for the Deutsche Bahn Timetables API plan endpoint
+PLAN_API_URL = "https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1/plan"
+client_id = os.getenv("DB_CLIENT_ID")
+client_secret = os.getenv("DB_CLIENT_SECRET")
+
+# Destinations that are NOT towards the city center from Ottobrunn.
+# Trains going to these destinations will be ignored.
+OUTBOUND_DESTINATIONS = [
+    "Kreuzstraße",
+    "Aying",
+    "Höhenkirchen-Siegertsbrunn",
+    "Dürrnhaar",
+    "Hohenbrunn",
+    "Wächterhof"
+]
+
+def get_next_train_minutes(eva_number, client_id, client_secret):
+    """
+    Finds the very next departure towards the city center and returns the
+    number of minutes until it departs.
+    """
+    headers = {
+        "DB-Client-Id": client_id,
+        "DB-Api-Key": client_secret,
+        "accept": "application/xml"
+    }
+    
+    now = datetime.now()
+    all_stops = []
+
+    # Fetch data for the current and next hour to ensure we don't miss upcoming trains
+    for i in range(2):
+        check_time = now + timedelta(hours=i)
+        date = check_time.strftime('%y%m%d')
+        hour = check_time.strftime('%H')
+
+        try:
+            response = requests.get(f"{PLAN_API_URL}/{eva_number}/{date}/{hour}", headers=headers)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            all_stops.extend(root.findall('s'))
+        except requests.exceptions.RequestException as e:
+            # Print errors to the standard error stream to not interfere with the output
+            print(f"Error fetching data: {e}", file=sys.stderr)
+            return None
+
+    upcoming_departures_minutes = []
+
+    for stop in all_stops:
+        try:
+            # Get the final destination from the path attribute
+            path_string = stop.find('.//dp').get('ppth')
+            destination = path_string.split('|')[-1]
+
+            # Filter out trains going away from the city
+            if destination in OUTBOUND_DESTINATIONS:
+                continue
+
+            # Calculate minutes until departure
+            departure_time_raw = stop.find('.//dp').get('pt')
+            departure_dt = datetime.strptime(departure_time_raw, '%y%m%d%H%M')
+
+            # Ignore trains that have already departed
+            if departure_dt < now:
+                continue
+
+            minutes_until = int((departure_dt - now).total_seconds() / 60)
+            upcoming_departures_minutes.append(minutes_until)
+        except (AttributeError, IndexError):
+            # Ignore any malformed 'stop' elements in the XML response
+            continue
+
+    if upcoming_departures_minutes:
+        return min(upcoming_departures_minutes)
+    else:
+        return None
+
+def main():
+    """
+    Main function to run the script.
+    """
+    
+    # The official EVA number for Ottobrunn station
+    ottobrunn_eva_number = "8004733"
+    
+    next_train_in = get_next_train_minutes(ottobrunn_eva_number, client_id, client_secret)
+
+    if next_train_in is not None:
+        # The final, simplified output
+        print(next_train_in)
+    else:
+        # If no train is found, print an error message to stderr and exit
+        print("No upcoming train towards the city center found.", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
