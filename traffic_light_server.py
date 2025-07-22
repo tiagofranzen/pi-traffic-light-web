@@ -21,6 +21,7 @@ current_mode = "auto"
 current_color = "unknown"
 last_state_change_time = 0
 s_bahn_minutes_away = -1 # -1 means unknown/no train
+weather_status = {}      # To hold weather data, e.g., {'temp': 20, 'condition': 'Clear'}
 
 # --- GPIO Setup ---
 GPIO.setmode(GPIO.BCM)
@@ -29,13 +30,12 @@ yellow = LED(27, active_high=False)
 green = LED(17, active_high=False)
 all_lights = [red, yellow, green]
 
-# --- Core Light Control Helper Function (DEFINITIVELY CORRECTED) ---
+# --- Core Light Control Helper Function ---
 def set_light_state(color_to_set):
     """Sets the physical light state. ONLY called by the controller thread."""
     global current_color
-    
-    # The faulty check that caused the toggle bug has been permanently removed.
-    # This function will now always execute the command correctly.
+    if current_color == color_to_set:
+        return
         
     for light in all_lights:
         light.off()
@@ -48,84 +48,82 @@ def set_light_state(color_to_set):
     
     current_color = color_to_set
 
-# --- S-Bahn Data Fetching Logic (from get_s5.py) ---
+# --- S-Bahn Data Fetching Logic ---
 def get_next_train_minutes(eva_number, client_id, client_secret):
-    """
-    Finds the very next departure towards the city center and returns the
-    number of minutes until it departs.
-    """
     PLAN_API_URL = "https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1/plan"
     OUTBOUND_DESTINATIONS = ["Kreuzstraße", "Aying", "Höhenkirchen-Siegertsbrunn", "Dürrnhaar", "Hohenbrunn", "Wächterhof"]
-    
-    headers = {
-        "DB-Client-Id": client_id,
-        "DB-Api-Key": client_secret,
-        "accept": "application/xml"
-    }
-    
+    headers = {"DB-Client-Id": client_id, "DB-Api-Key": client_secret, "accept": "application/xml"}
     now = datetime.now()
     all_stops = []
-
     for i in range(2):
         check_time = now + timedelta(hours=i)
-        date = check_time.strftime('%y%m%d')
-        hour = check_time.strftime('%H')
-
+        date, hour = check_time.strftime('%y%m%d'), check_time.strftime('%H')
         try:
             response = requests.get(f"{PLAN_API_URL}/{eva_number}/{date}/{hour}", headers=headers, timeout=15)
             response.raise_for_status()
             root = ET.fromstring(response.content)
             all_stops.extend(root.findall('s'))
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching data: {e}", file=sys.stderr)
+            print(f"Error fetching S-Bahn data: {e}", file=sys.stderr)
             return None
-
     upcoming_departures_minutes = []
-
     for stop in all_stops:
         try:
             path_string = stop.find('.//dp').get('ppth')
             destination = path_string.split('|')[-1]
-
-            if destination in OUTBOUND_DESTINATIONS:
-                continue
-
+            if destination in OUTBOUND_DESTINATIONS: continue
             departure_time_raw = stop.find('.//dp').get('pt')
             departure_dt = datetime.strptime(departure_time_raw, '%y%m%d%H%M')
-
-            if departure_dt < now:
-                continue
-
+            if departure_dt < now: continue
             minutes_until = int((departure_dt - now).total_seconds() / 60)
             upcoming_departures_minutes.append(minutes_until)
-        except (AttributeError, IndexError):
-            continue
-
+        except (AttributeError, IndexError): continue
     return min(upcoming_departures_minutes) if upcoming_departures_minutes else None
 
 def s_bahn_monitor():
     """Runs in a separate thread to periodically fetch S-Bahn data."""
     global s_bahn_minutes_away
-    client_id = os.getenv("DB_CLIENT_ID")
-    client_secret = os.getenv("DB_CLIENT_SECRET")
+    client_id, client_secret = os.getenv("DB_CLIENT_ID"), os.getenv("DB_CLIENT_SECRET")
     ottobrunn_eva = "8004733"
-
     if not client_id or not client_secret:
-        print("Error: DB_CLIENT_ID and DB_CLIENT_SECRET environment variables not set.", file=sys.stderr)
+        print("S-Bahn Monitor disabled: DB API keys not set.", file=sys.stderr)
+        return
+    while True:
+        minutes = get_next_train_minutes(ottobrunn_eva, client_id, client_secret)
+        with state_lock:
+            s_bahn_minutes_away = minutes if minutes is not None else -1
+        sleep(30)
+
+# --- NEW: Biergarten Weather Monitor ---
+def weather_monitor():
+    """Runs in a separate thread to fetch weather data every 15 minutes."""
+    global weather_status
+    api_key = os.getenv("OWM_API_KEY")
+    # Coordinates for Hohenbrunn, Bavaria
+    lat, lon = "48.0667", "11.7167"
+    WEATHER_API_URL = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={api_key}&units=metric"
+    
+    if not api_key:
+        print("Biergarten Monitor disabled: OWM_API_KEY not set.", file=sys.stderr)
         return
 
     while True:
-        print("S-Bahn Monitor: Fetching latest departure data...")
-        minutes = get_next_train_minutes(ottobrunn_eva, client_id, client_secret)
-        with state_lock:
-            if minutes is not None:
-                s_bahn_minutes_away = minutes
-                print(f"S-Bahn Monitor: Next train in {minutes} minutes.")
-            else:
-                s_bahn_minutes_away = -1 # No train found or error
-                print("S-Bahn Monitor: No upcoming train found.")
-        # Fetch data more frequently for more accurate countdown
-        sleep(30)
+        print("Biergarten Monitor: Fetching weather data...")
+        try:
+            response = requests.get(WEATHER_API_URL, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            temp = data.get('main', {}).get('temp')
+            condition = data.get('weather', [{}])[0].get('main')
+            with state_lock:
+                weather_status = {'temp': temp, 'condition': condition}
+                print(f"Biergarten Monitor: Weather is {temp}°C, {condition}.")
+        except Exception as e:
+            print(f"Error fetching weather data: {e}", file=sys.stderr)
+            with state_lock:
+                weather_status = {} # Clear status on error
+        # Fetch weather every 15 minutes
+        sleep(900)
 
 # --- Main Controller Thread ---
 def traffic_light_controller():
@@ -179,19 +177,23 @@ def traffic_light_controller():
                     last_state_change_time = now
             elif current_mode == "s_bahn":
                 minutes = s_bahn_minutes_away
-                
-                if minutes == -1:
-                    loop_sleep = 0.5
-                    set_light_state('red' if current_color != 'red' else 'off')
-                elif minutes < 9:
-                    set_light_state('red')
-                elif minutes == 9:
-                    loop_sleep = 0.5
-                    set_light_state('yellow' if current_color != 'yellow' else 'off')
-                elif minutes <= 12:
-                    set_light_state('yellow')
-                else: # minutes > 12
-                    set_light_state('green')
+                if minutes == -1: loop_sleep = 0.5; set_light_state('red' if current_color != 'red' else 'off')
+                elif minutes < 9: set_light_state('red')
+                elif minutes == 9: loop_sleep = 0.5; set_light_state('yellow' if current_color != 'yellow' else 'off')
+                elif minutes <= 12: set_light_state('yellow')
+                else: set_light_state('green')
+            elif current_mode == "biergarten":
+                temp = weather_status.get('temp')
+                condition = weather_status.get('condition')
+                hour = datetime.now().hour
+                if temp is None or condition is None:
+                    loop_sleep = 0.5; set_light_state('red' if current_color != 'red' else 'off') # No data
+                elif hour < 16 or temp < 15 or "Rain" in condition or "Snow" in condition:
+                    set_light_state('red') # Forget it
+                elif temp < 18 or "Clouds" in condition:
+                    set_light_state('yellow') # A bit of a risk
+                else: # Temp > 18 and clear
+                    set_light_state('green') # Let's go!
 
         sleep(loop_sleep)
 
@@ -204,7 +206,7 @@ class StatusHandler(BaseHTTPRequestHandler):
         if parsed_path.path == '/status':
             self.send_response(200); self.send_header('Content-type', 'application/json'); self.end_headers()
             with state_lock:
-                status = {'color': current_color, 'mode': current_mode, 's_bahn_minutes': s_bahn_minutes_away}
+                status = {'color': current_color, 'mode': current_mode, 's_bahn_minutes': s_bahn_minutes_away, 'weather': weather_status}
             self.wfile.write(json.dumps(status).encode('utf-8'))
             return
 
@@ -301,7 +303,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                         margin-top: 0;
                         margin-bottom: 8px;
                     }}
-                    #s-bahn-info {{
+                    .info-text {{
                         height: 22px;
                         font-size: 1em;
                         font-style: italic;
@@ -342,13 +344,14 @@ class StatusHandler(BaseHTTPRequestHandler):
                     </div>
                     <div class="controls">
                         <h2 id="modeText">Current Mode: <strong></strong></h2>
-                        <div id="s-bahn-info"></div>
+                        <div id="info-display" class="info-text"></div>
                         <div class="mode-buttons">
                             <a href="#" id="mode-auto" onclick="handleModeClick('auto')">Auto</a>
                             <a href="#" id="mode-emergency" onclick="handleModeClick('emergency')">Emergency</a>
                             <a href="#" id="mode-sos" onclick="handleModeClick('sos')">SOS</a>
                             <a href="#" id="mode-party" onclick="handleModeClick('party')">Party</a>
                             <a href="#" id="mode-s_bahn" onclick="handleModeClick('s_bahn')">S-Bahn</a>
+                            <a href="#" id="mode-biergarten" onclick="handleModeClick('biergarten')">Biergarten</a>
                         </div>
                     </div>
                 </div>
@@ -357,7 +360,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                     let currentModeFromServer = 'unknown';
                     let localAnimationId = null; 
 
-                    function updateVisuals(color, mode, s_bahn_minutes) {{
+                    function updateVisuals(color, mode, s_bahn_minutes, weather) {{
                         if (currentModeFromServer !== mode) {{
                             const currentActive = document.querySelector('.mode-buttons a.active');
                             if (currentActive) {{ currentActive.classList.remove('active'); }}
@@ -369,15 +372,17 @@ class StatusHandler(BaseHTTPRequestHandler):
                         currentModeFromServer = mode;
                         document.querySelector('#modeText strong').textContent = (mode === 'idle') ? 'OFF' : mode.replace('_', ' ').toUpperCase();
                         
-                        const sBahnInfo = document.getElementById('s-bahn-info');
+                        const infoDisplay = document.getElementById('info-display');
                         if (mode === 's_bahn') {{
-                            if (s_bahn_minutes === -1) {{
-                                sBahnInfo.textContent = 'No S-Bahn data available.';
+                            infoDisplay.textContent = (s_bahn_minutes === -1) ? 'No S-Bahn data.' : `Next train in ${{s_bahn_minutes}} min.`;
+                        }} else if (mode === 'biergarten') {{
+                            if (weather && weather.temp && weather.condition) {{
+                                infoDisplay.textContent = `${{weather.temp.toFixed(1)}}°C, ${{weather.condition}}`;
                             }} else {{
-                                sBahnInfo.textContent = `Next train in ${{s_bahn_minutes}} min.`;
+                                infoDisplay.textContent = 'No weather data.';
                             }}
                         }} else {{
-                            sBahnInfo.textContent = '';
+                            infoDisplay.textContent = '';
                         }}
 
                         const isRedOn = color === 'red' || color === 'red_and_yellow' || color === 'all_on';
@@ -400,7 +405,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                         stopLocalAnimation();
                         localAnimationId = setInterval(() => {{
                             const colors = ['red', 'yellow', 'green', 'off'];
-                            updateVisuals(colors[Math.floor(Math.random() * colors.length)], 'party', -1);
+                            updateVisuals(colors[Math.floor(Math.random() * colors.length)], 'party', -1, {{}});
                         }}, 80);
                     }}
 
@@ -415,7 +420,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                         function runSosStep() {{
                             if (currentModeFromServer !== 'sos') return;
                             const step = sosPattern[sosIndex];
-                            updateVisuals(step.state, 'sos', -1);
+                            updateVisuals(step.state, 'sos', -1, {{}});
                             sosIndex = (sosIndex + 1) % sosPattern.length;
                             localAnimationId = setTimeout(runSosStep, step.duration);
                         }}
@@ -429,14 +434,8 @@ class StatusHandler(BaseHTTPRequestHandler):
 
                     function handleModeClick(mode) {{
                         const isTogglingOff = currentModeFromServer === mode;
-                        
-                        // ALWAYS stop any local animation when a mode button is clicked.
                         stopLocalAnimation(); 
-                        
-                        // Send the command to the server.
                         fetch(`/?action=set_mode&mode=${{mode}}`);
-                        
-                        // If we are turning a new mode ON, start its animation immediately.
                         if (!isTogglingOff) {{
                             if (mode === 'party') startPartyAnimation();
                             else if (mode === 'sos') startSosAnimation();
@@ -444,15 +443,12 @@ class StatusHandler(BaseHTTPRequestHandler):
                     }}
 
                     async function syncWithServer() {{
-                        // Don't sync if a local animation is running
                         if (localAnimationId) return;
                         try {{
                             const response = await fetch('/status');
                             const status = await response.json();
-                            updateVisuals(status.color, status.mode, status.s_bahn_minutes);
-                        }} catch (e) {{
-                            // Errors are expected if server restarts, do nothing.
-                        }}
+                            updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather);
+                        }} catch (e) {{}}
                     }}
                     
                     setInterval(syncWithServer, 400);
@@ -485,13 +481,10 @@ if __name__ == "__main__":
     try:
         initialization_sequence()
         
-        # Start the main light controller thread
-        light_thread = threading.Thread(target=traffic_light_controller, daemon=True)
-        light_thread.start()
-
-        # Start the new S-Bahn monitor thread
-        s_bahn_thread = threading.Thread(target=s_bahn_monitor, daemon=True)
-        s_bahn_thread.start()
+        # Start all background threads
+        threading.Thread(target=traffic_light_controller, daemon=True).start()
+        threading.Thread(target=s_bahn_monitor, daemon=True).start()
+        threading.Thread(target=weather_monitor, daemon=True).start()
         
         run_server()
     except KeyboardInterrupt:
