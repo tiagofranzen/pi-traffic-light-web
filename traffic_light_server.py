@@ -31,6 +31,8 @@ all_lights = [red, yellow, green]
 def set_light_state(color_to_set):
     """Sets the physical light state. ONLY called by the controller thread."""
     global current_color
+    # This check is important to prevent the controller from doing redundant work
+    # on every loop, but it is safe in this new architecture.
     if current_color == color_to_set:
         return
         
@@ -124,8 +126,14 @@ class StatusHandler(BaseHTTPRequestHandler):
         if action:
             with state_lock:
                 if action == 'set_color':
+                    clicked_color = query_params['color'][0]
+                    # The server now handles the toggle logic
+                    if current_mode == 'manual' and current_color == clicked_color:
+                        target_manual_color = 'off'
+                    else:
+                        target_manual_color = clicked_color
                     target_mode = 'manual'
-                    target_manual_color = query_params['color'][0]
+
                 elif action == 'set_mode':
                     new_mode = query_params['mode'][0]
                     target_mode = 'idle' if current_mode == new_mode else new_mode
@@ -134,7 +142,6 @@ class StatusHandler(BaseHTTPRequestHandler):
             
         if parsed_path.path == '/':
             self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
-            # NOTE: All curly braces for CSS and JS must be escaped by doubling them (e.g., {{ ... }})
             html = f"""
             <!DOCTYPE html>
             <html lang="en">
@@ -174,12 +181,11 @@ class StatusHandler(BaseHTTPRequestHandler):
                 </div>
 
                 <script>
-                    let clientSideColor = 'unknown';
-                    let clientSideMode = 'unknown';
+                    let currentModeFromServer = 'unknown';
                     let localAnimationId = null; 
 
                     function updateVisuals(color, mode) {{
-                        if (clientSideMode !== mode) {{
+                        if (currentModeFromServer !== mode) {{
                             const currentActive = document.querySelector('.mode-buttons a.active');
                             if (currentActive) {{ currentActive.classList.remove('active'); }}
                             if (mode !== 'idle' && mode !== 'manual') {{
@@ -187,7 +193,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                                 if (newActive) {{ newActive.classList.add('active'); }}
                             }}
                         }}
-                        clientSideMode = mode;
+                        currentModeFromServer = mode;
                         document.querySelector('#modeText strong').textContent = (mode === 'idle') ? 'OFF' : mode.replace('_', ' ').toUpperCase();
                         
                         const isRedOn = color === 'red' || color === 'red_and_yellow' || color === 'all_on';
@@ -219,11 +225,11 @@ class StatusHandler(BaseHTTPRequestHandler):
                         const sosPattern = [
                             {{state: 'all_on', duration: 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 200}}, {{state: 'off', duration: 400}},
                             {{state: 'all_on', duration: 600}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 600}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 600}}, {{state: 'off', duration: 400}},
-                            {{state: 'all_on', duration: 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 200}}, {{state: 'off', duration: 1500}},
+                            {{state: 'all_on', duration: 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', 'duration': 200}}, {{state: 'off', duration: 200}},{{state: 'all_on', duration: 200}}, {{state: 'off', duration: 1500}},
                         ];
                         let sosIndex = 0;
                         function runSosStep() {{
-                            if (clientSideMode !== 'sos') return;
+                            if (currentModeFromServer !== 'sos') return;
                             const step = sosPattern[sosIndex];
                             updateVisuals(step.state, 'sos');
                             sosIndex = (sosIndex + 1) % sosPattern.length;
@@ -234,25 +240,22 @@ class StatusHandler(BaseHTTPRequestHandler):
 
                     function handleLightClick(color) {{
                         stopLocalAnimation();
-                        const targetColor = (clientSideColor === color && clientSideMode === 'manual') ? 'off' : color;
-                        updateVisuals(targetColor, 'manual');
-                        fetch(`/?action=set_color&color=${{targetColor}}`);
+                        // Just send the command. The server handles all logic.
+                        fetch(`/?action=set_color&color=${{color}}`);
                     }}
 
                     function handleModeClick(mode) {{
-                        stopLocalAnimation();
-                        const isTogglingOff = clientSideMode === mode;
-                        const newMode = isTogglingOff ? 'idle' : mode;
-                        // Optimistic UI update for mode button
-                        updateVisuals(clientSideColor, newMode);
+                        stopLocalAnimation(); 
                         fetch(`/?action=set_mode&mode=${{mode}}`).then(() => {{
-                            if (newMode === 'party') startPartyAnimation();
-                            else if (newMode === 'sos') startSosAnimation();
+                            // Start local animation immediately after command is sent
+                            if (mode === 'party' && currentModeFromServer !== 'idle') startPartyAnimation();
+                            else if (mode === 'sos' && currentModeFromServer !== 'idle') startSosAnimation();
                         }});
                     }}
 
                     async function syncWithServer() {{
-                        if (localAnimationId) return; // Don't sync if a local animation is running
+                        // Don't sync if a local animation is running
+                        if (localAnimationId) return;
                         try {{
                             const response = await fetch('/status');
                             const status = await response.json();
@@ -262,7 +265,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                         }}
                     }}
                     
-                    setInterval(syncWithServer, 400); // Poll slightly faster
+                    setInterval(syncWithServer, 400);
                     syncWithServer();
                 </script>
             </body>
