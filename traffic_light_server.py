@@ -17,9 +17,9 @@ last_state_change_time = 0
 
 # --- GPIO Setup ---
 GPIO.setmode(GPIO.BCM)
-red = LED(17, active_high=True)
-yellow = LED(27, active_high=True)
-green = LED(18, active_high=True)
+red = LED(22, active_high=False)
+yellow = LED(27, active_high=False)
+green = LED(17, active_high=False)
 all_lights = [red, yellow, green]
 
 # --- Core Light Control Helper Function ---
