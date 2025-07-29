@@ -98,7 +98,7 @@ def weather_monitor():
         sleep(900)
 
 def get_next_train_minutes(eva_number, client_id, client_secret):
-    """Fetches and parses train data from the DB API. Logic now matches the working script."""
+    """Fetches and parses train data from the DB API, specifically for the S5 line."""
     PLAN_API_URL = "https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1/plan"
     OUTBOUND_DESTINATIONS = ["Kreuzstraße", "Aying", "Höhenkirchen-Siegertsbrunn", "Dürrnhaar", "Hohenbrunn", "Wächterhof"]
     headers = {"DB-Client-Id": client_id, "DB-Api-Key": client_secret, "accept": "application/xml"}
@@ -116,7 +116,12 @@ def get_next_train_minutes(eva_number, client_id, client_secret):
     upcoming_departures_minutes = []
     for stop in all_stops:
         try:
-            # The faulty line that checked for "S5" has been removed.
+            tl_element = stop.find('.//tl')
+            if tl_element is None: continue
+            line_category = tl_element.get('c')
+            line_number = tl_element.get('n')
+            if not (line_category == 'S' and line_number == '5'):
+                continue
             path_string = stop.find('.//dp').get('ppth')
             destination = path_string.split('|')[-1]
             if destination in OUTBOUND_DESTINATIONS: continue
@@ -155,7 +160,8 @@ def traffic_light_controller():
         set_light_state("green")
         last_state_change_time = time()
     while True:
-        loop_sleep = 0.05
+        # OPTIMIZATION: Default to a slower loop speed for non-intensive modes
+        loop_sleep = 0.2
         with state_lock:
             if current_mode != target_mode:
                 current_mode = target_mode
@@ -176,7 +182,9 @@ def traffic_light_controller():
             }
             handler = mode_handlers.get(current_mode)
             if handler:
-                loop_sleep = handler(elapsed) or 0.1
+                custom_sleep = handler(elapsed)
+                if custom_sleep is not None:
+                    loop_sleep = custom_sleep
         sleep(loop_sleep)
 
 def handle_auto_mode(elapsed):
@@ -218,6 +226,7 @@ def handle_racing_mode(elapsed):
     else: # Live phase
         live_color = iracing_light_status if iracing_light_status != 'black' else 'off'
         set_light_state(live_color)
+        return 0.05 # Fast loop for live racing data
 
 # --- Web Server ---
 class StatusHandler(BaseHTTPRequestHandler):
