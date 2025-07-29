@@ -346,6 +346,10 @@ def run_server():
 if __name__ == "__main__":
     try:
         initialization_sequence()
+        # --- OPTIMIZATION: Add a startup delay ---
+        print("Waiting 15 seconds for network services to start...")
+        sleep(15)
+        
         threading.Thread(target=traffic_light_controller, daemon=True).start()
         threading.Thread(target=s_bahn_monitor, daemon=True).start()
         threading.Thread(target=weather_monitor, daemon=True).start()
