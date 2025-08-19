@@ -24,7 +24,8 @@ last_state_change_time = 0
 s_bahn_minutes_away = -1
 weather_status = {}
 iracing_light_status = "black"
-traffic_status = {} # e.g., {'delay_percent': 30, 'duration_in_traffic': '25 mins'}
+space_weather_status = {}
+traffic_status = {}
 
 # --- CORRECTED: Mode-specific state moved to global scope ---
 mode_state = {
@@ -94,38 +95,71 @@ def weather_monitor():
             with state_lock: weather_status = {}
         sleep(900)
 
+def space_weather_monitor():
+    """Runs in a separate thread to fetch planetary K-index data every 15 minutes."""
+    global space_weather_status
+    SPACE_WEATHER_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+    while True:
+        print("Space Weather Monitor: Fetching K-index data...")
+        try:
+            response = requests.get(SPACE_WEATHER_URL, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            latest_data = data[-1]
+            kp_index = int(float(latest_data[1]))
+            condition = "Quiet"
+            if kp_index >= 5: condition = "Storm"
+            elif kp_index == 4: condition = "Active"
+            with state_lock:
+                space_weather_status = {'kp_index': kp_index, 'condition': condition}
+                print(f"Space Weather Monitor: Kp-index is {kp_index} ({condition}).")
+        except Exception as e:
+            print(f"Error fetching space weather data: {e}", file=sys.stderr)
+            with state_lock: space_weather_status = {}
+        sleep(900)
+
 def traffic_monitor():
-    """Runs in a separate thread to fetch live traffic data every 10 minutes."""
+    """Runs in a separate thread to fetch live traffic data for multiple key routes."""
     global traffic_status
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    # --- UPDATED: Your specific home and work addresses ---
-    origin = "Nelkenstraße 24A, 85521 Hohenbrunn, Germany"
-    destination = "Landaubogen 1, 81373 München, Germany"
-    TRAFFIC_API_URL = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={destination}&key={api_key}&departure_time=now"
     if not api_key:
         print("Stau Monitor disabled: GOOGLE_MAPS_API_KEY not set.", file=sys.stderr)
         return
+    routes = [
+        {"name": "commute", "origin": "Nelkenstraße 24A, 85521 Hohenbrunn, Germany", "destination": "Landaubogen 1, 81373 München, Germany"},
+        {"name": "center", "origin": "Hohenbrunn, Germany", "destination": "Marienplatz, Munich, Germany"},
+        {"name": "north", "origin": "Hohenbrunn, Germany", "destination": "BMW Welt, Munich, Germany"}
+    ]
     while True:
-        print("Stau Monitor: Fetching traffic data...")
-        try:
-            response = requests.get(TRAFFIC_API_URL, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            if data.get('status') == 'OK':
-                route = data['routes'][0]['legs'][0]
-                duration_sec = route['duration']['value']
-                duration_in_traffic_sec = route['duration_in_traffic']['value']
-                duration_in_traffic_text = route['duration_in_traffic']['text']
-                delay_percent = ((duration_in_traffic_sec - duration_sec) / duration_sec) * 100 if duration_sec > 0 else 0
-                with state_lock:
-                    traffic_status = {'delay_percent': delay_percent, 'duration_in_traffic': duration_in_traffic_text}
-                    print(f"Stau Monitor: Current travel time is {duration_in_traffic_text} ({delay_percent:.0f}% delay).")
+        print("Stau Monitor: Fetching traffic data for all routes...")
+        delays = []
+        commute_time_text = "N/A"
+        for route in routes:
+            try:
+                url = f"https://maps.googleapis.com/maps/api/directions/json?origin={route['origin']}&destination={route['destination']}&key={api_key}&departure_time=now"
+                response = requests.get(url, timeout=15)
+                response.raise_for_status()
+                data = response.json()
+                if data.get('status') == 'OK':
+                    leg = data['routes'][0]['legs'][0]
+                    duration_sec = leg['duration']['value']
+                    duration_in_traffic_sec = leg['duration_in_traffic']['value']
+                    delay_percent = ((duration_in_traffic_sec - duration_sec) / duration_sec) * 100 if duration_sec > 0 else 0
+                    delays.append(delay_percent)
+                    if route['name'] == 'commute':
+                        commute_time_text = leg['duration_in_traffic']['text']
+                else:
+                    print(f"Stau Monitor: Google API error for route {route['name']}: {data.get('status')}")
+            except Exception as e:
+                print(f"Error fetching traffic data for route {route['name']}: {e}", file=sys.stderr)
+        with state_lock:
+            if delays:
+                avg_delay = sum(delays) / len(delays)
+                traffic_status = {'avg_delay': avg_delay, 'commute_time': commute_time_text}
+                print(f"Stau Monitor: Average delay is {avg_delay:.0f}%. Your commute time is {commute_time_text}.")
             else:
-                with state_lock: traffic_status = {}
-        except Exception as e:
-            print(f"Error fetching traffic data: {e}", file=sys.stderr)
-            with state_lock: traffic_status = {}
-        sleep(600) # 10 minutes
+                traffic_status = {}
+        sleep(600)
 
 def get_next_train_minutes(eva_number, client_id, client_secret):
     """Fetches and parses train data from the DB API, specifically for the S5 line."""
@@ -207,7 +241,7 @@ def traffic_light_controller():
             mode_handlers = {
                 "auto": handle_auto_mode, "party": handle_party_mode, "emergency": handle_emergency_mode,
                 "sos": handle_sos_mode, "s_bahn": handle_s_bahn_mode, "biergarten": handle_biergarten_mode,
-                "racing": handle_racing_mode, "stau": handle_stau_mode
+                "racing": handle_racing_mode, "space": handle_space_mode, "stau": handle_stau_mode
             }
             handler = mode_handlers.get(current_mode)
             if handler:
@@ -257,11 +291,18 @@ def handle_racing_mode(elapsed):
         set_light_state(live_color)
         return 0.05
 
+def handle_space_mode(elapsed):
+    kp = space_weather_status.get('kp_index')
+    if kp is None: set_light_state('red' if current_color != 'red' else 'off'); return 0.5
+    elif kp >= 5: set_light_state('red' if current_color != 'red' else 'off'); return 0.5
+    elif kp == 4: set_light_state('yellow')
+    else: set_light_state('green')
+
 def handle_stau_mode(elapsed):
-    delay = traffic_status.get('delay_percent')
+    delay = traffic_status.get('avg_delay')
     if delay is None: set_light_state('red' if current_color != 'red' else 'off'); return 0.5
-    elif delay > 50: set_light_state('red')
-    elif delay > 25: set_light_state('yellow')
+    elif delay > 45: set_light_state('red')
+    elif delay > 20: set_light_state('yellow')
     else: set_light_state('green')
 
 # --- Web Server ---
@@ -271,7 +312,7 @@ class StatusHandler(BaseHTTPRequestHandler):
         parsed_path = urlparse(self.path)
         if parsed_path.path == '/status':
             self.send_response(200); self.send_header('Content-type', 'application/json'); self.end_headers()
-            with state_lock: status = {'color': current_color, 'mode': current_mode, 's_bahn_minutes': s_bahn_minutes_away, 'weather': weather_status, 'race_step': mode_state.get('race_step', 0), 'traffic': traffic_status}
+            with state_lock: status = {'color': current_color, 'mode': current_mode, 's_bahn_minutes': s_bahn_minutes_away, 'weather': weather_status, 'race_step': mode_state.get('race_step', 0), 'space_weather': space_weather_status, 'traffic': traffic_status}
             self.wfile.write(json.dumps(status).encode('utf-8')); return
         query_params = parse_qs(parsed_path.query)
         action = query_params.get('action', [None])[0]
@@ -294,10 +335,10 @@ def get_html_content():
     return f"""
     <!DOCTYPE html><html lang="en"><head><title>Traffic Light Control</title><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>:root{{--bg-color:#1a1d23;--body-bg:#111317;--text-color:#e0e0e0;--text-muted:#888;--accent-color:#007bff;--shadow-color:rgba(0,0,0,0.5)}}html,body{{height:100%;margin:0;padding:0;background-color:var(--body-bg);font-family:'Inter',sans-serif;color:var(--text-color);-webkit-tap-highlight-color:transparent;display:flex;justify-content:center;align-items:center}}.container{{width:100%;max-width:380px;padding:20px;box-sizing:border-box;display:flex;flex-direction:column;align-items:center;gap:25px}}.traffic-light-body{{background-color:var(--bg-color);border-radius:24px;padding:20px;display:flex;flex-direction:column;gap:15px;border:1px solid #333;box-shadow:0 10px 30px var(--shadow-color)}}.light{{width:90px;height:90px;border-radius:50%;background-color:#333;opacity:0.5;transition:all .15s ease-in-out;cursor:pointer;box-shadow:inset 0 2px 10px rgba(0,0,0,.4)}}.red-on{{background-color:#ff1c1c;opacity:1;box-shadow:0 0 40px #ff1c1c,inset 0 2px 10px rgba(0,0,0,.4)}}.yellow-on{{background-color:#ffc700;opacity:1;box-shadow:0 0 40px #ffc700,inset 0 2px 10px rgba(0,0,0,.4)}}.green-on{{background-color:#00ff00;opacity:1;box-shadow:0 0 40px #00ff00,inset 0 2px 10px rgba(0,0,0,.4)}}.controls{{text-align:center;width:100%}}#modeText{{font-size:1.5em;font-weight:600;margin-top:0;margin-bottom:8px}}.info-text{{height:22px;font-size:1em;font-style:italic;color:var(--text-muted);margin-bottom:20px}}.mode-buttons{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;width:100%}}.mode-buttons a{{background-color:#333;color:var(--text-color);padding:12px 10px;border-radius:12px;font-size:1em;font-weight:600;text-decoration:none;transition:background-color .2s,transform .1s}}.mode-buttons a:active{{transform:scale(.95)}}.mode-buttons a.active{{background-color:var(--accent-color);color:#fff}}</style></head>
-    <body><div class="container"><div class="traffic-light-body" id="traffic-light"><div id="red" class="light" onclick="handleLightClick('red')"></div><div id="yellow" class="light" onclick="handleLightClick('yellow')"></div><div id="green" class="light" onclick="handleLightClick('green')"></div></div><div class="controls"><h2 id="modeText">Current Mode: <strong></strong></h2><div id="info-display" class="info-text"></div><div class="mode-buttons"><a href="#" id="mode-auto" onclick="handleModeClick('auto')">Auto</a><a href="#" id="mode-emergency" onclick="handleModeClick('emergency')">Emergency</a><a href="#" id="mode-sos" onclick="handleModeClick('sos')">SOS</a><a href="#" id="mode-party" onclick="handleModeClick('party')">Party</a><a href="#" id="mode-s_bahn" onclick="handleModeClick('s_bahn')">S-Bahn</a><a href="#" id="mode-biergarten" onclick="handleModeClick('biergarten')">Biergarten</a><a href="#" id="mode-racing" onclick="handleModeClick('racing')">Racing</a><a href="#" id="mode-stau" onclick="handleModeClick('stau')">Stau</a></div></div></div>
+    <body><div class="container"><div class="traffic-light-body" id="traffic-light"><div id="red" class="light" onclick="handleLightClick('red')"></div><div id="yellow" class="light" onclick="handleLightClick('yellow')"></div><div id="green" class="light" onclick="handleLightClick('green')"></div></div><div class="controls"><h2 id="modeText">Current Mode: <strong></strong></h2><div id="info-display" class="info-text"></div><div class="mode-buttons"><a href="#" id="mode-auto" onclick="handleModeClick('auto')">Auto</a><a href="#" id="mode-emergency" onclick="handleModeClick('emergency')">Emergency</a><a href="#" id="mode-sos" onclick="handleModeClick('sos')">SOS</a><a href="#" id="mode-party" onclick="handleModeClick('party')">Party</a><a href="#" id="mode-s_bahn" onclick="handleModeClick('s_bahn')">S-Bahn</a><a href="#" id="mode-biergarten" onclick="handleModeClick('biergarten')">Biergarten</a><a href="#" id="mode-racing" onclick="handleModeClick('racing')">Racing</a><a href="#" id="mode-stau" onclick="handleModeClick('stau')">Stau</a><a href="#" id="mode-space" onclick="handleModeClick('space')">Space</a></div></div></div>
     <script>
         let currentModeFromServer = 'unknown'; let localAnimationId = null;
-        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, traffic) {{
+        function updateVisuals(color, mode, s_bahn_minutes, weather, race_step, space_weather, traffic) {{
             if (currentModeFromServer !== mode) {{
                 const currentActive = document.querySelector('.mode-buttons a.active');
                 if (currentActive) currentActive.classList.remove('active');
@@ -315,8 +356,12 @@ def get_html_content():
                 else {{ infoDisplay.textContent = 'No weather data.'; }}
             }}
             else if (mode === 'racing' && race_step >= 4) {{ infoDisplay.textContent = 'Listening for iRacing...'; }}
+            else if (mode === 'space') {{
+                if (space_weather && space_weather.kp_index !== undefined) {{ infoDisplay.textContent = `Kp-index: ${{space_weather.kp_index}} (${{space_weather.condition}})`; }}
+                else {{ infoDisplay.textContent = 'No space weather data.'; }}
+            }}
             else if (mode === 'stau') {{
-                if (traffic && traffic.duration_in_traffic) {{ infoDisplay.textContent = `Trip time: ${{traffic.duration_in_traffic}}`; }}
+                if (traffic && traffic.commute_time) {{ infoDisplay.textContent = `Commute: ${{traffic.commute_time}}`; }}
                 else {{ infoDisplay.textContent = 'No traffic data.'; }}
             }}
             else {{ infoDisplay.textContent = ''; }}
@@ -328,7 +373,7 @@ def get_html_content():
             document.getElementById('green').className = 'light' + (isGreenOn ? ' green-on' : '');
         }}
         function stopLocalAnimation() {{ if (localAnimationId) {{ clearInterval(localAnimationId); clearTimeout(localAnimationId); localAnimationId = null; }} }}
-        function startPartyAnimation() {{ stopLocalAnimation(); localAnimationId = setInterval(() => {{ const colors = ['red', 'yellow', 'green', 'off']; updateVisuals(colors[Math.floor(Math.random() * colors.length)], 'party', -1, {{}}, 0, {{}}); }}, 80); }}
+        function startPartyAnimation() {{ stopLocalAnimation(); localAnimationId = setInterval(() => {{ const colors = ['red', 'yellow', 'green', 'off']; updateVisuals(colors[Math.floor(Math.random() * colors.length)], 'party', -1, {{}}, 0, {{}}, {{}}); }}, 80); }}
         function startSosAnimation() {{
             stopLocalAnimation();
             const sosPattern = [
@@ -339,7 +384,7 @@ def get_html_content():
             let sosIndex = 0;
             function runSosStep() {{
                 if (currentModeFromServer !== 'sos') return;
-                const step = sosPattern[sosIndex]; updateVisuals(step.state, 'sos', -1, {{}}, 0, {{}});
+                const step = sosPattern[sosIndex]; updateVisuals(step.state, 'sos', -1, {{}}, 0, {{}}, {{}});
                 sosIndex = (sosIndex + 1) % sosPattern.length;
                 localAnimationId = setTimeout(runSosStep, step.duration);
             }}
@@ -356,7 +401,7 @@ def get_html_content():
             try {{
                 const response = await fetch('/status');
                 const status = await response.json();
-                updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.traffic);
+                updateVisuals(status.color, status.mode, status.s_bahn_minutes, status.weather, status.race_step, status.space_weather, status.traffic);
             }} catch (e) {{}}
         }}
         setInterval(syncWithServer, 400);
@@ -392,6 +437,7 @@ if __name__ == "__main__":
         threading.Thread(target=s_bahn_monitor, daemon=True).start()
         threading.Thread(target=weather_monitor, daemon=True).start()
         threading.Thread(target=iracing_udp_listener, daemon=True).start()
+        threading.Thread(target=space_weather_monitor, daemon=True).start()
         threading.Thread(target=traffic_monitor, daemon=True).start()
         run_server()
     except KeyboardInterrupt:
