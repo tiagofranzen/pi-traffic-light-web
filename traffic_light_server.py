@@ -57,6 +57,8 @@ def set_light_state(color_to_set):
     elif color_to_set == "green": green.on()
     elif color_to_set == "red_and_yellow": red.on(); yellow.on()
     elif color_to_set == "all_on": red.on(); yellow.on(); green.on()
+    elif color_to_set == "green-yellow": green.on(); yellow.on()
+    
     current_color = color_to_set
 
 # --- Background Data Fetching Threads ---
@@ -162,7 +164,7 @@ def traffic_monitor():
         sleep(600)
 
 def get_next_train_minutes(eva_number, client_id, client_secret):
-    """Fetches and parses train data from the DB API, specifically for the S5 line."""
+    """Fetches and parses train data from the DB API. Logic now matches the working script."""
     PLAN_API_URL = "https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1/plan"
     OUTBOUND_DESTINATIONS = ["Kreuzstraße", "Aying", "Höhenkirchen-Siegertsbrunn", "Dürrnhaar", "Hohenbrunn", "Wächterhof"]
     headers = {"DB-Client-Id": client_id, "DB-Api-Key": client_secret, "accept": "application/xml"}
@@ -180,15 +182,12 @@ def get_next_train_minutes(eva_number, client_id, client_secret):
     upcoming_departures_minutes = []
     for stop in all_stops:
         try:
-            tl_element = stop.find('.//tl')
-            if tl_element is None: continue
-            line_category = tl_element.get('c')
-            line_number = tl_element.get('n')
-            if not (line_category == 'S' and line_number == '5'):
-                continue
+            # This logic matches the user's working script.
+            # It finds the final destination and filters out outbound trains.
             path_string = stop.find('.//dp').get('ppth')
             destination = path_string.split('|')[-1]
             if destination in OUTBOUND_DESTINATIONS: continue
+            
             departure_time_raw = stop.find('.//dp').get('pt')
             departure_dt = datetime.strptime(departure_time_raw, '%y%m%d%H%M')
             if departure_dt < now: continue
@@ -209,7 +208,8 @@ def iracing_udp_listener():
             try:
                 data, addr = sock.recvfrom(1024)
                 color = data.decode('utf-8').strip()
-                if color in ['red', 'yellow', 'green', 'black']:
+                valid_commands = ['red', 'yellow', 'green', 'black', 'green-yellow', 'all_on']
+                if color in valid_commands:
                     with state_lock:
                         iracing_light_status = color
             except Exception as e:
@@ -366,8 +366,8 @@ def get_html_content():
             }}
             else {{ infoDisplay.textContent = ''; }}
             const isRedOn = color === 'red' || color === 'red_and_yellow' || color === 'all_on';
-            const isYellowOn = color === 'yellow' || color === 'red_and_yellow' || color === 'all_on';
-            const isGreenOn = color === 'green' || color === 'all_on';
+            const isYellowOn = color === 'yellow' || color === 'red_and_yellow' || color === 'all_on' || color === 'green-yellow';
+            const isGreenOn = color === 'green' || color === 'all_on' || color === 'green-yellow';
             document.getElementById('red').className = 'light' + (isRedOn ? ' red-on' : '');
             document.getElementById('yellow').className = 'light' + (isYellowOn ? ' yellow-on' : '');
             document.getElementById('green').className = 'light' + (isGreenOn ? ' green-on' : '');
@@ -431,8 +431,6 @@ def run_server():
 if __name__ == "__main__":
     try:
         initialization_sequence()
-        print("Waiting 15 seconds for network services to start...")
-        sleep(15)
         threading.Thread(target=traffic_light_controller, daemon=True).start()
         threading.Thread(target=s_bahn_monitor, daemon=True).start()
         threading.Thread(target=weather_monitor, daemon=True).start()
